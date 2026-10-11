@@ -142,6 +142,29 @@ To fix it, call remat.recompute_needs_tensor(t) on the output tensor, right befo
         # pyrefly: ignore[bad-argument-type]
         self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, x)))
 
+    def test_recompute_needs_tensor_on_view_of_view_save_output(self) -> None:
+        # A SAVE region whose output is itself a view of a buffer it computed (as a
+        # kernel that pads rows and returns the unpadded slice does), reshaped by the
+        # caller. The reshape references the buffer, not the region's output object,
+        # so marking it must still persist the output after that object is freed.
+        def padded_mul(t: torch.Tensor) -> torch.Tensor:
+            padded = torch.cat([t, t.new_zeros(2)]) * 2
+            return padded[: t.shape[0]]
+
+        def body(x: torch.Tensor) -> torch.Tensor:
+            v = remat.region(padded_mul, "padded_mul", recompute=False)(x)
+            v = v.reshape(2, 2)  # bare view of the SAVE output, which goes away
+            remat.recompute_needs_tensor(v)
+            return torch.relu(v)
+
+        def reference(x: torch.Tensor) -> torch.Tensor:
+            return torch.relu((x * 2).reshape(2, 2))
+
+        x = torch.tensor([1.0, -1.0, 2.0, -2.0], requires_grad=True)
+        checkpoint_for_test()(body)(x).sum().backward()
+        # pyrefly: ignore[bad-argument-type]
+        self.assertTrue(torch.allclose(x.grad, _ref_grad(reference, x)))
+
     def test_region_consuming_bare_view_of_save_output_works(self) -> None:
         # A remat.region consuming a *bare view* of a SAVE output needs no annotation: the
         # view is resolved to its producer by storage, so the consumer triggers the

@@ -1302,7 +1302,14 @@ def _prepare_outputs(
         persist = _PersistOutputThunk(
             record=record,
             slot_index=index,
-            output_ref=weakref.ref(real),
+            base_ref=weakref.ref(real._base if real._is_view() else real),
+            view=(
+                (tuple(real.shape), tuple(real.stride()), real.storage_offset())
+                if real._is_view()
+                else None
+            ),
+            requires_grad=real.requires_grad,
+            is_leaf=real.is_leaf,
             hooks=hooks,
             context=context,
         )
@@ -1340,11 +1347,17 @@ class _PersistOutputThunk:
     itself saved for backward. All consumer kinds share one tape slot, the output's
     position.
 
-    The output is referenced *weakly* and snapshotted (detached) only when called:
-    every consumer holds the output live at the moment it fires this, and until then
-    nothing pins it -- a SAVE output consumed by nothing is freed after the forward
+    The output's data is referenced *weakly* and snapshotted (detached) only when
+    called: every consumer holds that data live at the moment it fires this, and until
+    then nothing pins it -- a SAVE output consumed by nothing is freed after the forward
     rather than kept resident to backward. A dead weakref means no consumer, so the
     call is a no-op.
+
+    The weak reference is to the output's root base, not to the output tensor object,
+    and a view output is rebuilt from it with its recorded geometry. A consumer can
+    hold the output only through a further view, which references the root base
+    rather than the output object (e.g. an op that returns a view of a padded buffer,
+    reshaped by its caller), so the output object itself may already be gone.
 
     The saved-tensor hooks (and any context they capture) are snapshotted at *region
     exit*, where this thunk is built (see :func:`_register_save_outputs`), not read when
@@ -1356,7 +1369,12 @@ class _PersistOutputThunk:
 
     record: _SaveRecord
     slot_index: int
-    output_ref: weakref.ReferenceType[torch.Tensor]
+    base_ref: weakref.ReferenceType[torch.Tensor]
+    # (shape, stride, storage_offset) of a view output; ``None`` if the output is its
+    # own base.
+    view: tuple[tuple[int, ...], tuple[int, ...], int] | None
+    requires_grad: bool
+    is_leaf: bool
     # Snapshotted at region exit (in-window), so a deferred fire still packs against the
     # producer's hooks and context. ``None`` when no user hook was installed.
     hooks: _SavedTensorsHooks | None = None
@@ -1365,15 +1383,17 @@ class _PersistOutputThunk:
     def __call__(self) -> None:
         if self.slot_index in self.record.output_slots:
             return
-        real = self.output_ref()
-        if real is None:
+        base = self.base_ref()
+        if base is None:
             return
         # The consumer that fires this can run in a different SPMD typing scope than
         # the producer: e.g. the output was made inside a local_map body (local types)
         # and is read by a globally typed consumer through a view the body returned.
         # This detach only snapshots the value for replay, so skip type checking it.
         with _no_spmd_typecheck():
-            detached = real.detach()
+            detached = base.detach()
+            if self.view is not None:
+                detached = detached.as_strided(*self.view)
         if self.hooks is not None:
             # Bind the matching unpack hook to the slot so replay reloads via the pair
             # that packed it, not whatever hooks are active at load time. Pack against the
@@ -1388,15 +1408,15 @@ class _PersistOutputThunk:
                     SavedTensorKind.SAVE_OUTPUT,
                 ),
                 unpack_hook=self.hooks.unpack,
-                requires_grad=real.requires_grad,
-                is_leaf=real.is_leaf,
+                requires_grad=self.requires_grad,
+                is_leaf=self.is_leaf,
             )
             return
         self.record.output_slots[self.slot_index] = _OutputSlot(
             tensor=detached,
             version=detached._version,
-            requires_grad=real.requires_grad,
-            is_leaf=real.is_leaf,
+            requires_grad=self.requires_grad,
+            is_leaf=self.is_leaf,
         )
 
 
